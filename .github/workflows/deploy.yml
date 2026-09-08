@@ -1,0 +1,62 @@
+name: Deploy frontend to production
+
+# Auto-sync: every push to main that touches the frontend builds the SPA and
+# publishes it to the production box (shuake.cornna.xyz) — no manual deploy
+# needed. Backend changes are intentionally NOT auto-deployed (they rebuild
+# containers / touch the DB) and stay a manual `docker-compose up -d --build`.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'scripts/hotfix_publish.sh'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch: {}
+
+# Never run two deploys at once; let an in-flight deploy finish.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Publish to production
+        env:
+          SSH_KEY_DATA: ${{ secrets.VPS_SSH_KEY }}
+          SERVER_SSH_KNOWN_HOSTS: ${{ secrets.SERVER_SSH_KNOWN_HOSTS }}
+          SERVER_IP: ${{ secrets.VPS_HOST }}
+          SERVER_USER: ${{ secrets.VPS_USER }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_KEY_DATA:-}" ] || [ -z "${SERVER_IP:-}" ] || [ -z "${SERVER_SSH_KNOWN_HOSTS:-}" ]; then
+            echo "::error::Missing VPS_SSH_KEY / VPS_HOST / SERVER_SSH_KNOWN_HOSTS secrets — cannot deploy." >&2
+            exit 1
+          fi
+          install -m 700 -d "$HOME/.ssh"
+          key_file="$(mktemp "$HOME/.ssh/uh_deploy_key.XXXXXX")"
+          known_hosts_file="$(mktemp "$HOME/.ssh/uh_known_hosts.XXXXXX")"
+          trap 'rm -f -- "$key_file" "$known_hosts_file"' EXIT
+          printf '%s\n' "$SSH_KEY_DATA" > "$key_file"
+          printf '%s\n' "$SERVER_SSH_KNOWN_HOSTS" > "$known_hosts_file"
+          chmod 600 "$key_file" "$known_hosts_file"
+          # Reuse the project's deploy tool (the "更新器") in key mode.
+          SSH_KEY="$key_file" SSH_KNOWN_HOSTS_FILE="$known_hosts_file" bash scripts/hotfix_publish.sh --frontend

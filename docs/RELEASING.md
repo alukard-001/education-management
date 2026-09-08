@@ -1,0 +1,173 @@
+# Releasing
+
+A release is cut by pushing a `v*` git tag. The `release` workflow
+(`.github/workflows/release.yml`) fans out from that one tag into:
+
+- **create-release** — a *draft* GitHub Release (so every build leg attaches to one release).
+- **app-image** / **web-image** — independent multi-arch server image builds pushed to their
+  respective GHCR repositories under an immutable `:<image_version>` tag only. The build
+  action exposes the content digest for the promotion gate; these jobs never build or push
+  `:latest`.
+- **desktop** — Windows / macOS (arm64 + Intel) / Linux installers + updater artifacts (Tauri).
+- **promote-images** — after every build gate succeeds, retags each exact image digest as
+  `:latest` in its own GHCR repository.
+- **publish** — flips the draft to published only after image promotion and **every** desktop
+  leg succeed.
+
+The git tag is the single source of truth for the version; `scripts/set_version.sh`
+stamps it into all eight versioned files—six manifests (`frontend/package.json`,
+`frontend/package-lock.json`, `backend/pyproject.toml`, `backend/app/main.py`,
+`frontend/src-tauri/tauri.conf.json`, `frontend/src-tauri/Cargo.toml`) plus two lockfiles
+(`backend/uv.lock`, `frontend/src-tauri/Cargo.lock`).
+The workflow's `tag`, `version`, and `release_id` outputs keep their existing contract. Only the
+Docker tag is normalized to `image_version` (a `+` in version metadata becomes `_`, because
+Docker tags do not allow `+`).
+
+## Cutting a release
+
+```bash
+# 1. Stamp + commit the version on main. Push main and wait for the main-branch
+#    CI run to pass before creating any release tag.
+bash scripts/set_version.sh 1.4.0
+git commit -am "chore: v1.4.0"
+MAIN_SHA="$(git rev-parse HEAD)"
+git push origin main
+gh run list --workflow test.yml --branch main --commit "$MAIN_SHA" --limit 5
+gh run watch <main-ci-run-id> --exit-status
+# If this push changed frontend/** (or the deploy workflow), also wait for the
+# frontend production deploy to finish before tagging.
+gh run list --workflow deploy.yml --branch main --commit "$MAIN_SHA" --limit 5
+gh run watch <frontend-deploy-run-id> --exit-status
+
+# 2. Create an annotated tag only after the checks/deploy above succeed, then
+#    push that tag explicitly; keep the tag push as a separate command.
+git tag -a v1.4.0 -m v1.4.0
+git push origin v1.4.0
+
+# 3. Watch the tag-triggered release workflow:
+gh run list --workflow release.yml --limit 5
+gh run watch <release-run-id> --exit-status
+# 4. Verify: gh release view v1.4.0  → installers (.msi/.dmg/.AppImage) + latest.json attached
+```
+
+In this documented path, the `release` workflow is triggered by the explicitly pushed
+`v1.4.0` tag. Waiting for
+the `main` CI run (and for the frontend production deploy when that workflow is triggered)
+keeps the release build from racing an in-flight main-branch validation or frontend deploy.
+If the push did not match the deploy workflow's `paths` filter, no frontend deploy run is
+expected; still confirm that CI passed before tagging.
+
+### Immutable-first image promotion and publication
+
+The server images use an all-gates-before-promotion flow:
+
+1. `app-image` and `web-image` each build and push their multi-arch image under the immutable
+   `:<image_version>` tag and return the digest produced by `docker/build-push-action`.
+2. The `promote-images` job waits for `create-release`, `app-image`, `web-image`, and `desktop`.
+   It validates both `image_version` values and digests, then runs `docker buildx imagetools
+   create` from each `<repository>@<digest>` to that repository's `:latest` tag. Promotion does
+   not rebuild, pull, or resolve a mutable tag.
+3. The `publish` job waits for `create-release`, `app-image`, `web-image`, `desktop`, and
+   `promote-images`, then changes the draft release to published.
+
+The `promote-images` job updates the two GHCR repositories sequentially, so the cross-repository
+operation is not atomic: an app `:latest` update can succeed before a web update fails. A failed
+image or desktop gate skips promotion and publication. When `create-release` has made the draft,
+any promotion or publish failure leaves that GitHub Release draft/unpublished: if promotion fails,
+any update already completed remains, while `publish` is blocked; if the publish command fails,
+the release is not successfully published until the failure is fixed and the workflow is retried.
+
+### Desktop runners
+
+The desktop matrix currently uses these runner labels:
+
+- Linux: `ubuntu-22.04`
+- Windows: `windows-latest`
+- macOS Apple Silicon: `macos-latest`
+- macOS Intel: `macos-15-intel`
+
+macOS caveat: the `x86_64-apple-darwin` desktop leg runs on a native Intel `macos-15-intel`
+runner because PyInstaller cannot cross-compile the sidecar; `aarch64-apple-darwin` runs
+on the Apple-Silicon `macos-latest`.
+
+## Updater signing keypair (free, one-time)
+
+The Tauri auto-updater needs a signing keypair (separate from OS code-signing; it is free).
+Without it, installers still build but carry no `.sig`/`latest.json` and won't auto-update.
+
+```bash
+cd frontend
+npm install                                   # ensures @tauri-apps/cli is available
+npm run tauri signer generate -- -w ~/.tauri/uh-updater.key
+#   (equivalent: npx @tauri-apps/cli@latest signer generate -w ~/.tauri/uh-updater.key)
+```
+
+It asks whether to protect the private key and writes:
+- `~/.tauri/uh-updater.key` — **private** key (NEVER commit; becomes a GitHub secret).
+- `~/.tauri/uh-updater.key.pub` — public key (committed inside `tauri.conf.json`).
+
+Store the secrets and wire the public key:
+
+```bash
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/uh-updater.key
+# Set this only when the private key is password-protected; never echo the value.
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+```
+
+The private key supplied to CI must cryptographically match the committed
+`frontend/src-tauri/tauri.conf.json` `plugins.updater.pubkey`. When generating a new pair,
+update the public-key field and the `TAURI_SIGNING_PRIVATE_KEY` secret together; do not mix a
+private key from one pair with a public key from another. If the private key is encrypted,
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` must contain its corresponding password; the workflow
+passes that value through to Tauri. If it is not encrypted, leave the password configuration
+unset according to repository secret policy. Keep `endpoints` at
+`https://github.com/sweetcornna/university-helper/releases/latest/download/latest.json`.
+
+Whether these secrets are configured is runtime repository/CI configuration. Verify the
+matching pair and the resulting workflow artifacts when cutting a release; do not infer or
+record their current presence or password state in this document.
+
+Checklist:
+- [ ] `chmod 600 ~/.tauri/uh-updater.key`; the key + `.pub` live **outside** the repo (never staged).
+- [ ] `TAURI_SIGNING_PRIVATE_KEY` contains the private key matching `tauri.conf.json` `plugins.updater.pubkey`.
+- [ ] If the private key is encrypted, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is configured with its matching password.
+- [ ] A signed desktop leg emits `*.sig` + `latest.json`; an unsigned leg still produces installers.
+
+## GHCR: make server images anonymously pullable (one-time)
+
+So the one-click `deploy_server.sh` (and the §11 deploy fix-forward) can `docker pull`
+without a login.
+
+```bash
+# (a) Allow Actions to write packages (UI: Settings → Actions → General → Workflow permissions → Read and write)
+gh api -X PUT /repos/sweetcornna/university-helper/actions/permissions/workflow \
+  -f default_workflow_permissions=write -F can_approve_pull_request_reviews=false
+
+# (b) (Re)publish images for a tag
+gh workflow run release.yml -f tag=v1.3.0 && gh run watch
+
+# (c) Make both container packages PUBLIC
+gh api -X PATCH /user/packages/container/university-helper-app -f visibility=public
+gh api -X PATCH /user/packages/container/university-helper-web -f visibility=public
+#   (UI fallback: Profile → Packages → <pkg> → Package settings → Change visibility → Public)
+
+# (d) Verify anonymous pull
+docker logout ghcr.io
+docker pull ghcr.io/sweetcornna/university-helper-web:latest
+docker pull ghcr.io/sweetcornna/university-helper-app:latest
+```
+
+Once both pull anonymously, the reported `Invalid host header` / `dependency app failed
+to start` deploy bug is fixed at the distribution level: a clean box running
+`bash scripts/deploy_server.sh --tag v1.3.0` pulls the current fixed images (which always
+seed `localhost`/`127.0.0.1` as TrustedHost patterns, `backend/app/main.py`), so the
+healthcheck no longer 400s.
+
+## Code-signing status (free-first)
+
+- **Linux** — no signing needed (`.AppImage`/`.deb`).
+- **Windows** — pursuing the free [SignPath Foundation](https://signpath.org/) OSS program; until
+  approved, builds are unsigned (SmartScreen "More info → Run anyway").
+- **macOS** — ad-hoc signed (Gatekeeper "right-click → Open"); an optional Apple Developer ID
+  ($99/yr) for notarization is planned. The CI signing steps are gated on secrets, so adding them
+  later needs no workflow change.
