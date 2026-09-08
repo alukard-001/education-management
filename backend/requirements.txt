@@ -17,7 +17,7 @@ httpx==0.28.1
 pyaes==1.6.1
 fonttools==4.61.1
 cryptography>=42,<44
-starlette>=0.40.0,<0.42.0
+starlette>=1.6.0,<1.7.0
 SQLAlchemy>=2.0,<3.0
 alembic>=1.13,<2.0
 # Desktop launcher (PROFILE=local sidecar): resolves the per-OS app-data dir.
